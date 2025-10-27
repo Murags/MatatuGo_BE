@@ -57,6 +57,7 @@ class AlembicManager:
 
     def run_migrations(self):
         try:
+            # Base.metadata.drop_all(bind=database_session_manager.engine)
             alembic.command.upgrade(self.alembic_config, "head")
             alembic.command.stamp(self.alembic_config, "head")
         except OperationalError:
