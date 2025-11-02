@@ -1,11 +1,7 @@
 from ...database import Base
 from .baseModel import BaseModel
 from sqlalchemy import Column, String, Float, Integer, Enum
-import enum
-
-class FarePeriod(enum.Enum):
-    PEAK = "peak"
-    OFF_PEAK = "off_peak"
+from sqlalchemy.orm import relationship
 
 class FareAttribute(Base):
     __tablename__ = "fare_definitions"
@@ -16,4 +12,6 @@ class FareAttribute(Base):
     payment_method: int = Column(Integer, default=0)
     transfers: int = Column(Integer, nullable=True)
     transfer_duration: int = Column(Integer, nullable=True)
-    period: FarePeriod = Column(Enum(FarePeriod), default=FarePeriod.OFF_PEAK)
+
+    # Relationships
+    fare_rules = relationship("FareRule", back_populates="fare_definition", cascade="all, delete-orphan")

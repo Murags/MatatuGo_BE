@@ -12,11 +12,13 @@ from alembic import context
 # Add the api directory to path
 sys.path.insert(0, dirname(dirname(abspath(__file__))))
 
+load_dotenv()
+
 # Import Base and models
 from app.database import Base
 from app.v1.models import *
 
-load_dotenv()
+# load_dotenv()
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
