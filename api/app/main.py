@@ -7,11 +7,12 @@ from .v1.router import router as v1_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        alembic_manager.run_migrations()
-    except Exception as e:
-        print(f"Error running migrations: {e}")
-        raise e
+    # try:
+    #     alembic_manager.run_migrations()
+    # except Exception as e:
+    #     print(f"Error running migrations: {e}")
+    #     raise e
+    print("Skipping migrations just for testing purposes")
     yield
 
 app = FastAPI(root_path="/api", lifespan=lifespan)
