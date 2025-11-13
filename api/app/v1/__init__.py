@@ -6,3 +6,5 @@ from .models.shapes import Shape
 from .models.stops import Stage
 from .models.stop_times import StopTime
 from .models.transfers import Transfer
+from .models.edges import Edge
+from .models.trips import Trip

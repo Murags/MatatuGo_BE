@@ -19,3 +19,4 @@ async def create_user(db: AsyncSession, request):
     except Exception as e:
         print(f"Error creating user: {e}")
         raise e
+
