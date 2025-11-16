@@ -1,3 +1,4 @@
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -5,13 +6,15 @@ from contextlib import asynccontextmanager
 from .database import alembic_manager
 from .v1.router import router as v1_router
 
+logger = logging.getLogger(__name__)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # try:
-    #     alembic_manager.run_migrations()
-    # except Exception as e:
-    #     print(f"Error running migrations: {e}")
-    #     raise e
+    try:
+        alembic_manager.run_migrations()
+    except Exception as e:
+        print(f"Error running migrations: {e}")
+        raise e
     print("Skipping migrations just for testing purposes")
     yield
 

@@ -10,7 +10,11 @@ import csv
 import logging
 from collections import defaultdict, namedtuple
 from sqlalchemy import text
-from ..database import database_session_manager
+
+# Fix import path for direct script execution
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
+from api.app.database import database_session_manager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gtfs_edges_builder")
@@ -265,8 +269,9 @@ class GTFSEdgeBuilder:
             )
 
             # Create edges between consecutive stops and multi-hop edges
+            max_hops = 6  # Allow up to 6 hops for more connectivity
             for i in range(len(stop_times)):
-                for j in range(i + 1, min(i + 9, len(stop_times))):  # Max 8 hops
+                for j in range(i + 1, min(i + max_hops + 1, len(stop_times))):
                     source_stop = stop_times[i]
                     target_stop = stop_times[j]
 
@@ -286,18 +291,29 @@ class GTFSEdgeBuilder:
 
                     hop_count = target_stop.stop_sequence - source_stop.stop_sequence
 
-                    # Calculate cost with frequency weighting
+                    # Distance-based filtering to prevent unrealistic shortcuts
+                    max_distance_per_hop = 1500  # Max 1.5km per hop for reasonable connectivity
+                    if distance > (hop_count * max_distance_per_hop):
+                        continue  # Skip edges that are too long for hop count
+
+                    # Route-based filtering for multi-hop edges
+                    if not self._should_create_multi_hop_edge(hop_count, distance, trip.route_id):
+                        continue
+
+                    # Calculate cost with frequency weighting and distance penalties
                     if hop_count == 1:
                         # Direct connection
                         base_cost = max(15, min(120, distance / 10))
                         cost = base_cost / max(frequency_score, 0.1)
                     else:
-                        # Multi-hop connection
-                        base_cost = max(25, min(250, 25 + (hop_count - 1) * 12 + distance / 15))
+                        # Multi-hop connection with higher distance penalty
+                        distance_penalty = max(0, (hop_count - 1) * 15)
+                        base_cost = max(25, min(250, 25 + distance_penalty + distance / 20))
                         cost = base_cost / max(frequency_score, 0.1)
 
                     edge_type = 'direct' if hop_count == 1 else 'multi_hop'
 
+                    # Forward edge
                     edges_data.append({
                         'source': source_stop.stop_id,
                         'target': target_stop.stop_id,
@@ -307,6 +323,24 @@ class GTFSEdgeBuilder:
                         'trip_id': trip_id,
                         'direction_id': trip.direction_id,
                         'stop_sequence': target_stop.stop_sequence,
+                        'hop_count': hop_count,
+                        'edge_type': edge_type,
+                        'service_frequency': frequency_score,
+                        'route_variant': route_variant,
+                        'peak_service': peak_service,
+                        'reliability_score': frequency_score
+                    })
+
+                    # Bidirectional: Add reverse edge
+                    edges_data.append({
+                        'source': target_stop.stop_id,
+                        'target': source_stop.stop_id,
+                        'cost': cost,
+                        'reverse_cost': cost,
+                        'route_id': trip.route_id,
+                        'trip_id': trip_id,
+                        'direction_id': trip.direction_id,
+                        'stop_sequence': source_stop.stop_sequence,
                         'hop_count': hop_count,
                         'edge_type': edge_type,
                         'service_frequency': frequency_score,
@@ -369,80 +403,54 @@ class GTFSEdgeBuilder:
         log.info(f"Inserted {len(edges_data):,} route edges")
 
     def _map_stops_to_nodes(self, conn, edges_data):
-        """Map GTFS stop_ids to database node_ids using parameterized queries"""
+        """Map GTFS stop_ids to database node_ids"""
         log.info("Mapping stops to database nodes...")
-        
+
         # Get all unique stop_ids
         stop_ids = set()
         for edge in edges_data:
             stop_ids.add(edge['source'])
             stop_ids.add(edge['target'])
-        
-        # Convert to list for easier handling
-        stop_ids_list = list(stop_ids)
-        
-        if not stop_ids_list:
-            log.warning("No stop IDs found to map")
-            return
-        
-        log.info(f"Mapping {len(stop_ids_list)} unique stops to nodes...")
-        
-        # Process in batches to avoid SQL query limits
-        batch_size = 1000
-        stop_to_node = {}
-        
-        for i in range(0, len(stop_ids_list), batch_size):
-            batch = stop_ids_list[i:i + batch_size]
-            
-            # Create parameterized query with proper placeholders
-            placeholders = ','.join([f':stop_id_{j}' for j in range(len(batch))])
-            mapping_sql = text(f"""
-                SELECT stop_id, node_id 
-                FROM stages 
+
+        # Query database for stop to node mapping
+        if stop_ids:
+            stop_ids_list = list(stop_ids)
+            placeholders = ','.join([f':stop_{i}' for i in range(len(stop_ids_list))])
+            params = {f'stop_{i}': stop_id for i, stop_id in enumerate(stop_ids_list)}
+            mapping_sql = f"""
+                SELECT stop_id, node_id
+                FROM stages
                 WHERE stop_id IN ({placeholders})
-            """)
-            
-            # Create parameters dictionary
-            params = {f'stop_id_{j}': stop_id for j, stop_id in enumerate(batch)}
-            
-            try:
-                result = conn.execute(mapping_sql, params).fetchall()
-                for row in result:
-                    stop_to_node[row._mapping['stop_id']] = row._mapping['node_id']
-            except Exception as e:
-                log.error(f"Error mapping batch {i//batch_size + 1}: {e}")
-                # Log problematic stop IDs for debugging
-                problematic_stops = [stop_id for stop_id in batch if "'" in stop_id or '"' in stop_id]
-                if problematic_stops:
-                    log.warning(f"Batch contains stops with special characters: {problematic_stops[:5]}...")
-                continue
-        
-        log.info(f"Successfully mapped {len(stop_to_node)} stops to nodes")
-        
-        # Add node_ids to edges_data
-        mapped_edges = 0
-        for edge in edges_data:
-            source_id = stop_to_node.get(edge['source'])
-            target_id = stop_to_node.get(edge['target'])
-            
-            if source_id and target_id:
-                edge['source_id'] = source_id
-                edge['target_id'] = target_id
-                mapped_edges += 1
-        
-        log.info(f"Mapped {mapped_edges} edges out of {len(edges_data)} total edges")
-        
-        # Log unmapped stops for debugging
-        unmapped_stops = []
-        for edge in edges_data:
-            if 'source_id' not in edge:
-                unmapped_stops.append(edge['source'])
-            if 'target_id' not in edge:
-                unmapped_stops.append(edge['target'])
-        
-        if unmapped_stops:
-            unique_unmapped = list(set(unmapped_stops))
-            log.warning(f"Found {len(unique_unmapped)} unmapped stops. First 10: {unique_unmapped[:10]}")
+            """
+
+            stop_to_node = {}
+            for row in conn.execute(text(mapping_sql), params).fetchall():
+                stop_to_node[row._mapping['stop_id']] = row._mapping['node_id']
+
+            log.info(f"Mapped {len(stop_to_node)} stops to nodes")
+
+            # Add node_ids to edges_data
+            for edge in edges_data:
+                source_id = stop_to_node.get(edge['source'])
+                target_id = stop_to_node.get(edge['target'])
+
+                if source_id and target_id:
+                    edge['source_id'] = source_id
+                    edge['target_id'] = target_id
+
+    def _should_create_multi_hop_edge(self, hop_count, distance, route_id):
+        """Decide whether to create a multi-hop edge based on route characteristics"""
+        # Direct hops: always allow
+        if hop_count == 1:
+            return True
+
+        # Express routes: allow more multi-hop edges for better connectivity
+        express_routes = ['23', '24', '46', '56', '111']
+        if any(er in route_id for er in express_routes):
+            return hop_count <= 4 and distance <= 5000  # Max 4 hops, 5km for express routes
+
+        # Local routes: generous multi-hop edges for maximum connectivity
+        return hop_count <= 6 and distance <= 8000  # Max 6 hops, 8km for local routes
 
     def _calculate_distance(self, lat1, lon1, lat2, lon2):
         """Calculate distance between two points in meters"""
@@ -510,8 +518,8 @@ class GTFSEdgeBuilder:
         """))
 
     def _insert_walking_edges(self, conn):
-        """Insert limited walking connections"""
-        log.info("Adding strategic walking edges...")
+        """Insert CBD-aware walking connections"""
+        log.info("Adding CBD-aware walking edges...")
 
         conn.execute(text("""
             INSERT INTO edges (
@@ -519,43 +527,57 @@ class GTFSEdgeBuilder:
                 cost, reverse_cost, edge_type, reliability_score,
                 created_at, updated_at
             )
-            SELECT
+            SELECT DISTINCT
                 walking_candidates.stop_id AS source,
                 walking_candidates.target_stop AS target,
                 walking_candidates.node_id AS source_id,
                 walking_candidates.target_node AS target_id,
 
-                -- Walking cost: time + penalty
-                (walking_candidates.distance_m / 80.0) + 40.0 AS cost,
-                (walking_candidates.distance_m / 80.0) + 40.0 AS reverse_cost,
+                -- CBD walking is cheaper/faster (100m/min vs 80m/min outside CBD)
+                CASE
+                    WHEN walking_candidates.is_cbd THEN (distance_m / 100.0) + 10.0  -- Faster CBD walking
+                    ELSE (distance_m / 80.0) + 30.0  -- Normal walking penalty
+                END AS cost,
+
+                CASE
+                    WHEN walking_candidates.is_cbd THEN (distance_m / 100.0) + 10.0
+                    ELSE (distance_m / 80.0) + 30.0
+                END AS reverse_cost,
+
                 'walking' AS edge_type,
-                0.7 AS reliability_score,
+                CASE WHEN walking_candidates.is_cbd THEN 0.9 ELSE 0.6 END AS reliability_score,
                 NOW(), NOW()
 
             FROM (
                 SELECT DISTINCT
-                    s1.stop_id, s1.node_id,
+                    s1.stop_id, s1.node_id, s1.stop_lat, s1.stop_lon,
                     s2.stop_id as target_stop, s2.node_id as target_node,
                     ST_DistanceSphere(
                         ST_MakePoint(s1.stop_lon, s1.stop_lat),
                         ST_MakePoint(s2.stop_lon, s2.stop_lat)
-                    ) as distance_m
+                    ) as distance_m,
+                    -- CBD detection (within 2km of city center: -1.286, 36.817)
+                    (ST_DistanceSphere(ST_MakePoint(s1.stop_lon, s1.stop_lat), ST_MakePoint(36.817, -1.286)) <= 2000
+                     AND ST_DistanceSphere(ST_MakePoint(s2.stop_lon, s2.stop_lat), ST_MakePoint(36.817, -1.286)) <= 2000) as is_cbd
                 FROM stages s1, stages s2
                 WHERE s1.stop_id != s2.stop_id
                 AND ST_DistanceSphere(
                     ST_MakePoint(s1.stop_lon, s1.stop_lat),
                     ST_MakePoint(s2.stop_lon, s2.stop_lat)
-                ) BETWEEN 100 AND 350  -- Very short walks only
-                -- Only between different route networks
-                AND NOT EXISTS (
+                ) BETWEEN 100 AND 600  -- Allow up to 600m for CBD walking
+            ) walking_candidates
+            WHERE
+                -- Allow CBD walking freely to enable better matatu connections
+                (walking_candidates.is_cbd) OR
+                -- Outside CBD, only walk between different route networks to avoid redundancy
+                (NOT EXISTS (
                     SELECT 1 FROM edges e
-                    WHERE ((e.source = s1.stop_id AND e.target = s2.stop_id)
-                        OR (e.source = s2.stop_id AND e.target = s1.stop_id))
+                    WHERE ((e.source = walking_candidates.stop_id AND e.target = walking_candidates.target_stop)
+                        OR (e.source = walking_candidates.target_stop AND e.target = walking_candidates.stop_id))
                     AND e.edge_type != 'walking'
                     AND e.route_id IS NOT NULL
-                )
-            ) walking_candidates
-            LIMIT 5000  -- Limit walking edges
+                ))
+            LIMIT 10000  -- Increased limit for CBD walking connections
         """))
 
     def _optimize_edges_table(self, conn):
@@ -597,7 +619,7 @@ class GTFSEdgeBuilder:
 
         conn.execute(text("ANALYZE edges"))
 
-        # Get final statistics  
+        # Print statistics
         stats = conn.execute(text("""
             SELECT
                 COUNT(*) as total_edges,
@@ -606,8 +628,8 @@ class GTFSEdgeBuilder:
                 COUNT(*) FILTER (WHERE edge_type = 'transfer') as transfer_edges,
                 COUNT(*) FILTER (WHERE edge_type = 'walking') as walking_edges,
                 COUNT(DISTINCT route_id) FILTER (WHERE route_id IS NOT NULL) as unique_routes,
-                CAST(AVG(service_frequency) FILTER (WHERE service_frequency > 0) AS DECIMAL(10,3)) as avg_frequency,
-                CAST(AVG(cost) AS DECIMAL(10,2)) as avg_cost
+                ROUND(AVG(service_frequency) FILTER (WHERE service_frequency > 0)::numeric, 3) as avg_frequency,
+                ROUND(AVG(cost)::numeric, 2) as avg_cost
             FROM edges
         """)).fetchone()
 

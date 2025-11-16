@@ -238,7 +238,7 @@ async def get_route_by_coordinates(
                 try:
                     route_sql = text("""
                         SELECT r.seq, r.node, r.edge, r.cost, r.agg_cost,
-                               s.stop_name, s.stop_lat, s.stop_lon, e.route_id, e.edge_type
+                               s.stop_name, e.route_id, e.edge_type
                         FROM pgr_dijkstra(
                             'SELECT id, source_id AS source, target_id AS target, cost FROM edges WHERE cost > 0',
                             :origin_node, :dest_node, directed := true
@@ -278,7 +278,7 @@ async def get_route_by_coordinates(
             good_routes = [r for r in direct_routes if r["transfers"] <= 1][:max_alternatives]
             if good_routes:
                 print(f"✓ Using direct routes ({len(good_routes)} found)")
-                return _format_routes_response(good_routes, "direct", conn)
+                return _format_routes_response(good_routes, "direct")
 
         # Step 3: Town fallback - route through town center
         print("Using town fallback routing...")
@@ -295,7 +295,7 @@ async def get_route_by_coordinates(
                 try:
                     route_sql = text("""
                         SELECT r.seq, r.node, r.edge, r.cost, r.agg_cost,
-                               s.stop_name, s.stop_lat, s.stop_lon, e.route_id, e.edge_type
+                               s.stop_name, e.route_id, e.edge_type
                         FROM pgr_dijkstra(
                             'SELECT id, source_id AS source, target_id AS target, cost FROM edges WHERE cost > 0',
                             :origin_node, :town_node, directed := true
@@ -331,7 +331,7 @@ async def get_route_by_coordinates(
                 try:
                     route_sql = text("""
                         SELECT r.seq, r.node, r.edge, r.cost, r.agg_cost,
-                               s.stop_name, s.stop_lat, s.stop_lon, e.route_id, e.edge_type
+                               s.stop_name, e.route_id, e.edge_type
                         FROM pgr_dijkstra(
                             'SELECT id, source_id AS source, target_id AS target, cost FROM edges WHERE cost > 0',
                             :town_node, :dest_node, directed := true
@@ -385,48 +385,35 @@ async def get_route_by_coordinates(
         best_town_routes = town_routes[:max_alternatives]
 
         print(f"✓ Using town fallback routes ({len(best_town_routes)} found)")
-        return _format_routes_response(best_town_routes, "town_fallback", conn)
+        return _format_routes_response(best_town_routes, "town_fallback")
 
 
 def _process_route_segments(route_rows):
-    """Helper function to process route segments with coordinates and costs"""
+    """Helper function to process route segments"""
     segments = []
     current_segment = None
     last_valid_route_id = None
-    stop_coordinates = {}  # Cache stop coordinates
-    segment_costs = {}     # Track actual costs per segment
 
     for i, row in enumerate(route_rows):
         route_id = row._mapping.get("route_id")
         stop_name = row._mapping.get("stop_name")
-        stop_lat = row._mapping.get("stop_lat")
-        stop_lon = row._mapping.get("stop_lon")
         edge_type = row._mapping.get("edge_type")
         edge_id = row._mapping.get("edge")
-        step_cost = row._mapping.get("step_cost", 0)
 
         if not stop_name:
             continue
 
-        # Cache stop coordinates
-        if stop_lat and stop_lon:
-            stop_coordinates[stop_name] = {"lat": stop_lat, "lon": stop_lon}
-
-        # Skip transfer edges as they don't represent actual travel
         if edge_type == "transfer":
             continue
 
-        # Handle pgRouting virtual destination edge
         if edge_id == -1 and not route_id and last_valid_route_id:
             route_id = last_valid_route_id
 
-        # Inherit route_id from previous stop if missing
         if not route_id and current_segment and current_segment.get("route_id"):
             route_id = current_segment["route_id"]
         elif not route_id:
             continue
 
-        # Track last valid route_id for edge -1 handling
         if route_id and edge_id != -1:
             last_valid_route_id = route_id
 
@@ -435,114 +422,50 @@ def _process_route_segments(route_rows):
                 "route_id": route_id,
                 "board": stop_name,
                 "stops": [stop_name],
-                "cbd_stops": [],
-                "raw_cost": step_cost
+                "cbd_stops": []
             }
         else:
             if route_id != current_segment["route_id"]:
-                # Route change - close current segment if it has meaningful travel
-                if len(current_segment["stops"]) >= 2:
+                if len(current_segment["stops"]) >= 1:
                     current_segment["alight"] = current_segment["stops"][-1]
                     segments.append(current_segment)
 
-                # Start new segment
                 current_segment = {
                     "route_id": route_id,
                     "board": stop_name,
                     "stops": [stop_name],
-                    "cbd_stops": [],
-                    "raw_cost": step_cost
+                    "cbd_stops": []
                 }
             else:
-                # Same route, add stop if not duplicate
                 if stop_name not in current_segment["stops"]:
                     current_segment["stops"].append(stop_name)
-                    current_segment["raw_cost"] += step_cost
 
-        # Track CBD stops (basic detection)
-        cbd_keywords = ['kencom', 'odeon', 'gpo', 'cbd', 'town', 'central', 'bus station']
-        if any(keyword in stop_name.lower() for keyword in cbd_keywords):
-            if stop_name not in current_segment.get("cbd_stops", []):
-                current_segment.setdefault("cbd_stops", []).append(stop_name)
-
-    # Close final segment if it has meaningful travel
-    if current_segment and len(current_segment["stops"]) >= 2:
+    if current_segment and len(current_segment["stops"]) > 0:
         current_segment["alight"] = current_segment["stops"][-1]
         segments.append(current_segment)
 
-    # Filter and enhance segments with coordinates and costs
-    valid_segments = []
-    for segment in segments:
-        if len(segment.get("stops", [])) >= 2 and segment.get("board") != segment.get("alight"):
-            # Add coordinates for board and alight stops
-            board_coords = stop_coordinates.get(segment["board"], {"lat": None, "lon": None})
-            alight_coords = stop_coordinates.get(segment["alight"], {"lat": None, "lon": None})
-            
-            segment["board_coordinates"] = board_coords
-            segment["alight_coordinates"] = alight_coords
-            
-            # Calculate estimated matatu fare (basic heuristic)
-            stop_count = len(segment["stops"])
-            segment["estimated_fare_ksh"] = max(20, min(stop_count * 8 + 15, 100))
-            
-            valid_segments.append(segment)
-
-    return valid_segments
+    return segments
 
 
-def _format_routes_response(routes, routing_type, conn=None):
-    """Format routes into enhanced response structure with coordinates and route labels"""
+def _format_routes_response(routes, routing_type):
+    """Format routes into response structure"""
     alternatives = []
-    
-    # Get route labels for all route IDs
-    all_route_ids = set()
-    for route in routes:
-        for segment in route["segments"]:
-            if segment.get("route_id"):
-                all_route_ids.add(segment["route_id"])
-    
-    route_labels = {}
-    if conn and all_route_ids:
-        from sqlalchemy import text
-        label_sql = text("""
-            SELECT route_id, route_short_name
-            FROM routes
-            WHERE route_id = ANY(:route_ids)
-        """)
-        try:
-            label_rows = conn.execute(label_sql, {"route_ids": list(all_route_ids)}).fetchall()
-            for row in label_rows:
-                route_labels[row._mapping["route_id"]] = row._mapping["route_short_name"]
-        except Exception as e:
-            print(f"Failed to fetch route labels: {e}")
 
     for i, route in enumerate(routes, 1):
         steps = []
-        total_estimated_fare = 0
-        
         for segment in route["segments"]:
-            route_label = route_labels.get(segment["route_id"], segment["route_id"])
-            estimated_fare = segment.get("estimated_fare_ksh", 0)
-            total_estimated_fare += estimated_fare
-            
             steps.append({
                 "board": segment["board"],
                 "alight": segment["alight"],
-                "board_coordinates": segment.get("board_coordinates", {"lat": None, "lon": None}),
-                "alight_coordinates": segment.get("alight_coordinates", {"lat": None, "lon": None}),
                 "route_id": segment["route_id"],
-                "matatu_number": route_label,  # Human-readable route number
                 "stops": segment["stops"],
-                "stop_count": len(segment["stops"]),
-                "estimated_fare_ksh": estimated_fare,
-                "raw_routing_cost": segment.get("raw_cost", 0)  # Cost without penalties
+                "stop_count": len(segment["stops"])
             })
 
         alternatives.append({
             "rank": i,
             "transfers": route["transfers"],
-            "algorithm_cost": route["cost"],  # Algorithm cost with penalties
-            "estimated_total_fare_ksh": total_estimated_fare,  # Real-world fare estimate
+            "cost": route["cost"],
             "steps": steps
         })
 
@@ -568,4 +491,5 @@ async def get_route_by_coordinates_llm(
 
     # Placeholder for LLM routing
     raise HTTPException(status_code=501, detail="LLM routing not yet implemented")
+
 
